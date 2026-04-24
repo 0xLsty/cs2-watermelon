@@ -25,7 +25,8 @@ function createWindow() {
       sandbox: false,
     },
   });
-
+  
+  win.removeMenu();
   win.maximize();
 
   if (process.env.NODE_ENV === 'development') {
