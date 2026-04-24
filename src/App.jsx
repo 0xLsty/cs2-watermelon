@@ -16,6 +16,8 @@ import {
   buildExtra,
   buildIdentityKey,
   buildTableExtra,
+  calculateAverageCost,
+  calculateRealizedProfit,
 } from './utils/portfolio';
 
 export default function CSInvestmentsDashboard() {
@@ -59,14 +61,10 @@ export default function CSInvestmentsDashboard() {
   useEffect(() => {
     if (!IS_ELECTRON) return;
     (async () => {
-      const [p, h, wiped] = await Promise.all([dbGet('portfolio'), dbGet('historico'), dbGet('data_wiped_v1')]);
-      if (!wiped) {
-        // First run after wipe: clear stored data
-        await Promise.all([dbSet('portfolio', []), dbSet('historico', []), dbSet('data_wiped_v1', true)]);
-      } else {
-        if (Array.isArray(p) && p.length > 0) setPortfolio(p);
-        if (Array.isArray(h) && h.length > 0) setHistorico(h);
-      }
+      const [p, h] = await Promise.all([dbGet('portfolio'), dbGet('historico')]);
+      if (Array.isArray(p)) setPortfolio(p);
+      if (Array.isArray(h)) setHistorico(h);
+      await dbSet('schemaVersion', 1);
       setDbLoaded(true);
     })();
   }, []);
@@ -174,13 +172,20 @@ export default function CSInvestmentsDashboard() {
     if (isNaN(qtd) || qtd < 1) { setErroForm('Quantidade deve ser um número inteiro positivo.'); return; }
     if (isNaN(preco) || preco <= 0) { setErroForm('Preço unitário inválido.'); return; }
     const novaQtd = ativoAdicionando.quantity + qtd;
-    const novoPM  = (ativoAdicionando.avgCost * ativoAdicionando.quantity + preco * qtd) / novaQtd;
+    const novoPM = calculateAverageCost({
+      currentQty: ativoAdicionando.quantity,
+      currentAvg: ativoAdicionando.avgCost,
+      buyQty: qtd,
+      buyPrice: preco,
+      fees: 0,
+    });
     setPortfolio(prev => prev.map(i =>
       i.id === ativoAdicionando.id ? { ...i, quantity: novaQtd, avgCost: novoPM } : i
     ));
     setHistorico(prev => [{
       id: Date.now(), data: dataAdicionar, mes: data.mes, ano: data.ano,
       tipo: 'Compra', ativo: ativoAdicionando.asset, categoria: ativoAdicionando.category,
+      assetId: ativoAdicionando.id, identityKey: ativoAdicionando.identityKey,
       quantidade: qtd, precoUnitario: preco, taxas: 0, valorTotal: qtd * preco,
     }, ...prev]);
     fecharModalAdicionar();
@@ -226,9 +231,19 @@ export default function CSInvestmentsDashboard() {
       setErroForm('Este ativo já existe no portfólio.');
       return;
     }
+
+    const novoId = existente ? existente.id : Date.now();
+
     if (existente) {
       const novaQtd = existente.quantity + quantidade;
-      const novoPM  = (existente.avgCost * existente.quantity + precoCompra * quantidade) / novaQtd;
+      const novoPM = calculateAverageCost({
+        currentQty: existente.quantity,
+        currentAvg: existente.avgCost,
+        buyQty: quantidade,
+        buyPrice: precoCompra,
+        fees: taxasCompra,
+      });
+
       setPortfolio(prev => prev.map(i => i.id === existente.id
         ? { ...i, quantity: novaQtd, avgCost: novoPM, current: precoAtual,
             liquidity: form.liquidity || i.liquidity, image: form.image || i.image,
@@ -237,10 +252,11 @@ export default function CSInvestmentsDashboard() {
         : i
       ));
     } else {
-      const novoId = Date.now();
       setPortfolio(prev => [...prev, {
         id: novoId, identityKey, asset: form.asset.trim(),
-        category: categoriaCompra, quantity: quantidade, avgCost: precoCompra,
+        category: categoriaCompra,
+        quantity: quantidade,
+        avgCost: (precoCompra * quantidade + taxasCompra) / quantidade,
         current: precoAtual,
         liquidity: form.liquidity, taxasCompra,
         image: form.image || 'https://placehold.co/96x96/111827/F9FAFB?text=ITEM',
@@ -248,11 +264,13 @@ export default function CSInvestmentsDashboard() {
       }]);
       setAtivoSelecionadoId(novoId);
     }
+
     setHistorico(prev => [{
       id: Date.now()+1, data: form.data, mes: data.mes, ano: data.ano,
       tipo: 'Compra', ativo: form.asset.trim(), categoria: categoriaCompra,
+      assetId: novoId, identityKey,
       quantidade, precoUnitario: precoCompra,
-      taxas: taxasCompra, valorTotal: quantidade * precoCompra,
+      taxas: taxasCompra, valorTotal: quantidade * precoCompra + taxasCompra,
     }, ...prev]);
     fecharModal();
   }
@@ -277,8 +295,12 @@ export default function CSInvestmentsDashboard() {
     setHistorico(prev => [{
       id: Date.now(), data: form.data, mes: data.mes, ano: data.ano,
       tipo: 'Venda', ativo: ativo.asset, categoria: ativo.category,
+      assetId: ativo.id,
+      identityKey: ativo.identityKey,
       quantidade: qtd, precoUnitario: preco, taxas,
       valorTotal: qtd * preco - taxas,
+      lucro: calculateRealizedProfit({ sellQty: qtd, sellPrice: preco, avgCost: ativo.avgCost, fees: taxas }),
+      ativoSnapshot: ativo,
     }, ...prev]);
     fecharModal();
   }
@@ -287,29 +309,59 @@ export default function CSInvestmentsDashboard() {
   function confirmarExclusaoTransacao() {
     const item = modalConfirmarExclusao;
     if (!item) return;
+
+    const matchesHistorico = (ativo) => {
+      if (item.identityKey) return ativo.identityKey === item.identityKey;
+      if (item.assetId) return ativo.id === item.assetId;
+      return ativo.asset === item.ativo && ativo.category === item.categoria;
+    };
+
     if (item.tipo === 'Compra') {
       setPortfolio(prev => {
         return prev.map(ativo => {
-          if (ativo.asset !== item.ativo || ativo.category !== item.categoria) return ativo;
+          if (!matchesHistorico(ativo)) return ativo;
+
           const novaQtd = ativo.quantity - item.quantidade;
           if (novaQtd <= 0) return null;
-          const novoPM = novaQtd > 0
-            ? (ativo.avgCost * ativo.quantity - item.precoUnitario * item.quantidade) / novaQtd
-            : ativo.avgCost;
-          return { ...ativo, quantity: novaQtd, avgCost: Math.max(0, novoPM) };
+
+          const custoAtual = ativo.avgCost * ativo.quantity;
+          const custoRemovido = (item.precoUnitario * item.quantidade) + (item.taxas || 0);
+          const novoPM = (custoAtual - custoRemovido) / novaQtd;
+
+          return {
+            ...ativo,
+            quantity: novaQtd,
+            avgCost: Math.max(0, Number.isFinite(novoPM) ? novoPM : ativo.avgCost),
+            taxasCompra: Math.max(0, (ativo.taxasCompra || 0) - (item.taxas || 0)),
+          };
         }).filter(Boolean);
       });
     } else if (item.tipo === 'Venda') {
       setPortfolio(prev => {
-        const existente = prev.find(a => a.asset === item.ativo && a.category === item.categoria);
+        const existente = prev.find(matchesHistorico);
+
         if (existente) {
-          const novaQtd = existente.quantity + item.quantidade;
-          const novoPM = (existente.avgCost * existente.quantity + item.precoUnitario * item.quantidade) / novaQtd;
-          return prev.map(a => a.id === existente.id ? { ...a, quantity: novaQtd, avgCost: novoPM } : a);
+          return prev.map(a =>
+            matchesHistorico(a)
+              ? { ...a, quantity: a.quantity + item.quantidade }
+              : a
+          );
         }
+
+        if (item.ativoSnapshot) {
+          return [
+            ...prev,
+            {
+              ...item.ativoSnapshot,
+              quantity: item.quantidade,
+            },
+          ];
+        }
+
         return prev;
       });
     }
+
     setHistorico(prev => prev.filter(h => h.id !== item.id));
     setModalConfirmarExclusao(null);
   }
