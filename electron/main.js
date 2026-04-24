@@ -16,6 +16,7 @@ function createWindow() {
     minWidth: 1024,
     minHeight: 700,
     backgroundColor: '#0f1319',
+    frame: false,
     webPreferences: {
       preload: path.join(__dirname, 'preload.js'),
       contextIsolation: true,
@@ -23,6 +24,8 @@ function createWindow() {
       sandbox: false,
     },
   });
+
+  win.maximize();
 
   if (process.env.NODE_ENV === 'development') {
     win.loadURL('http://localhost:5173');
